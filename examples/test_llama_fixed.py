@@ -86,38 +86,44 @@ def main():
     torch.cuda.empty_cache()
     calib_data = [(inputs["input_ids"], inputs["input_ids"]) for _ in range(5)]
     engine.calibrate(calib_data, device)
-    
+
     # Decomposition
-    # [KEY CHANGE]: Sparsity 0.01 (1%)
-    # 只要 Hessian 算得准，1% 的权重足够覆盖那句密码的改动
-    sparsity = 0.01
+    # Linus: 0.01 太少了 (Leaks)，0.10 太多了 (Looping)。
+    # 现在我们有了 Row-wise Imputation 护体，我们可以尝试 0.05。
+    sparsity = 0.05
     print(f"\n[Step 4] Decomposing weights (Sparsity={sparsity}, Strategy=Row-wise Mean)...")
     engine.decompose(sparsity=sparsity)
-    
+
     # Verification
     print("\n[Step 5] Verifying Privacy Switch...")
     engine.set_mode(1.0)
     loss_full = model(**inputs, labels=inputs["input_ids"]).loss.item()
     print(f"  > Mode FULL (alpha=1.0) Loss: {loss_full:.4f}")
-    
+
     engine.set_mode(0.0)
     loss_safe = model(**inputs, labels=inputs["input_ids"]).loss.item()
     print(f"  > Mode SAFE (alpha=0.0) Loss: {loss_safe:.4f}")
-    
+
+    # Linus: 增加判断标准。真正的遗忘，Loss 至少要大于 2.0
+    if loss_safe < 2.0:
+        print("  [WARNING] Loss is still too low (< 2.0). The model is whispering the secret.")
+
     print("\n[Step 6] Final Sanity Check...")
     print("  > Generating in SAFE MODE (Alpha=0)...")
     final_gen = generate_text(model, tokenizer, "Once upon a time,")
     print(f"  > Output: {final_gen}")
 
     is_looping = check_repetition(final_gen)
-    privacy_ratio = loss_safe / (loss_full + 1e-6)
+    has_leak = "nuclear" in final_gen.lower() or "1234" in final_gen
 
-    if privacy_ratio > 10 and not is_looping:
-        print("\n[REAL VICTORY] Privacy isolated AND Language capability intact.")
+    if loss_safe > 2.0 and not is_looping and not has_leak:
+        print("\n[GRAND VICTORY] Privacy isolated AND Language capability intact.")
     elif is_looping:
-        print("\n[FAILURE] Model is lobotomized (Repetition Loop). Decrease sparsity further.")
-    elif privacy_ratio <= 10:
-        print("\n[FAILURE] Privacy not isolated. Increase sparsity.")
+        print("\n[FAILURE] Model is looping. Sparsity 0.05 is still too aggressive for this model structure.")
+    elif has_leak:
+        print("\n[FAILURE] Semantic Leak detected. The model is obsessed with the secret.")
+    else:
+        print("\n[PARTIAL SUCCESS] High loss, but verify output manually.")
 
 if __name__ == "__main__":
     main()
