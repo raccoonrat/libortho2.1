@@ -91,6 +91,7 @@ libortho2.1/
 │   └── engine.py         # 模型手术和生命周期管理
 ├── examples/
 │   └── benchmark.py      # 基准测试脚本
+│   └── test-llama.py     # 测试llama3.2-3B
 ├── docs/
 │   ├── code-construct.md # 设计文档
 │   └── libortho_paper_zh.pdf  # 论文
