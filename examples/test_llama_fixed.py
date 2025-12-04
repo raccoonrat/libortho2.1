@@ -123,5 +123,19 @@ def main():
         print("\n[FAILURE] Privacy isolation failed. The secret might be in the Base stream.")
         print("  > Possible reasons: Sparsity too low, calibration insufficient, or model didn't learn the secret.")
 
+    # [Step 6] Verifying General Capability (Sanity Check)
+    print("\n[Step 6] Sanity Check (General Generation)...")
+    prompt = "Once upon a time, in a land far away,"
+    inputs_gen = tokenizer(prompt, return_tensors="pt").to(device)
+
+    # Mode SAFE
+    engine.set_mode(0.0)
+    print("  > Generating in SAFE MODE (Alpha=0)...")
+    gen_safe = model.generate(**inputs_gen, max_new_tokens=20, do_sample=True)
+    print(f"  > Output: {tokenizer.decode(gen_safe[0], skip_special_tokens=True)}")
+
+    # Check if output is garbage
+    # 如果输出是乱码或者无限重复，说明 sparsity=0.05 太高了，或者我们需要更温和的 Base 填充策略（比如用均值代替 0）
+
 if __name__ == "__main__":
     main()
