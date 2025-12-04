@@ -11,10 +11,7 @@ libortho/ops.py
 def fake_quantize_int4(w, group_size=128):
     """
     模拟 INT4 量化。
-    在生产环境中，这里应该是位操作（bit-packing）。
-    但在几何证明阶段，浮点模拟是完全可以接受的。
     """
-    # 1. Padding (处理边界情况，别让代码在维度不匹配时崩溃)
     original_shape = w.shape
     numel = w.numel()
     
@@ -23,64 +20,87 @@ def fake_quantize_int4(w, group_size=128):
         padding = group_size - (numel % group_size)
         w = F.pad(w.flatten(), (0, padding))
     
-    # 2. Reshape to groups
     w_grouped = w.view(-1, group_size)
-    
-    # 3. Calculate Scales (Absmax quantization)
-    # 避免除以零，加上 epsilon 是基本常识
     scales = w_grouped.abs().max(dim=1, keepdim=True)[0] + 1e-6
     
-    # 4. Quantize -> Clamp -> Dequantize
-    # Range: [-8, 7]
     w_int4 = torch.round(w_grouped / scales * 7.0)
     w_int4 = torch.clamp(w_int4, -8, 7)
     w_dequant = w_int4 / 7.0 * scales
     
-    # 5. Restore shape
     w_out = w_dequant.flatten()
     if padding > 0:
         w_out = w_out[:-padding]
     
     return w_out.view(original_shape)
 
-def calc_geometric_impact(residual, hessian_diag):
+def calc_geometric_impact(w_orig, w_quant, hessian_diag):
     """
     计算几何影响因子。
-    Formula: Impact = (w - q)^2 * Hessian
     
-    如果 hessian_diag 为 None，我们回退到普通的幅度剪枝（Magnitude Pruning）。
-    这让代码更健壮。
+    Linus Update:
+    之前我们只计算残差的影响 (w - q)^2 * H。
+    但在强过拟合场景下，权重本身的偏移才是关键。
+    如果 Hessian 很大，说明这个位置极其敏感，不管量化误差大不大，都应该被保护。
+    
+    所以这里我们混合策略：主要看 Hessian，辅以 Residual。
     """
+    residual = w_orig - w_quant
+    
     if hessian_diag is None:
         return residual ** 2
-    return (residual ** 2) * hessian_diag
+    
+    # 原始公式：
+    # return (residual ** 2) * hessian_diag
+    
+    # 改进公式：
+    # 对于强记忆任务，Hessian 本身就是最好的指示器。
+    # 我们给予 Hessian 更高的权重，哪怕 residual 很小（例如刚好落在量化点上），
+    # 只要 Hessian 巨大，我们也认为是 Outlier。
+    return (residual ** 2 + 1e-6) * hessian_diag
 
 def decompose_weights(w_orig, hessian_diag, sparsity_ratio):
     """
     执行几何分离的核心逻辑。
     返回: (w_base, ortho_indices, ortho_values)
+    
+    Linus Update:
+    引入 "Hard Separation" 逻辑。
+    对于 Top-K 的敏感权重，Base 流直接“脑叶切除”（设为0），
+    Ortho 流接管整个权重值。
     """
     # 1. Base Stream (量化投影)
-    w_base = fake_quantize_int4(w_orig)
-    residual = w_orig - w_base
+    w_quant = fake_quantize_int4(w_orig)
     
     # 2. Calculate Impact
-    impact = calc_geometric_impact(residual, hessian_diag)
+    impact = calc_geometric_impact(w_orig, w_quant, hessian_diag)
     
     # 3. Thresholding
-    # 找到第 k 大的值作为阈值
     k = int(impact.numel() * sparsity_ratio)
     if k <= 0:
-        return w_base, None, None
+        return w_quant, None, None
         
-    # flatten() 是必要的，因为 kthvalue 在最后一维工作
     threshold = torch.kthvalue(impact.flatten(), impact.numel() - k).values
     mask = impact > threshold
     
-    # 4. Extract Ortho Stream
-    # 使用 nonzero 提取索引。t() 是为了符合 sparse_coo 的格式 (2, N)
+    # 4. Extract Ortho Stream (Hard Separation Logic)
+    # ---------------------------------------------------------
+    # 策略：
+    # Outliers (Mask=True):  Base = 0,       Ortho = W_orig
+    # Inliers  (Mask=False): Base = W_quant, Ortho = 0
+    # ---------------------------------------------------------
+    
+    # 构造最终的 w_base
+    # 对于 Inlier，保持量化值
+    w_base = w_quant.clone()
+    
+    # 对于 Outlier，执行“切除术”，将 Base 设为 0 (或者为了更平滑，设为该层的均值，但 0 最安全)
+    # 注意：直接设为 0 可能会破坏激活分布，但在 Alpha=1 时 Ortho 会补回来。
+    # 在 Alpha=0 时，我们希望模型“忘记”，变傻总比泄密好。
+    w_base[mask] = 0 
+    
+    # 构造 Ortho Stream
+    # Ortho 现在承载的是完整的权重值，而不仅仅是残差
     ortho_indices = mask.nonzero(as_tuple=False).t()
-    ortho_values = residual[mask]
+    ortho_values = w_orig[mask]
     
     return w_base, ortho_indices, ortho_values
-
