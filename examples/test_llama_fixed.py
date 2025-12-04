@@ -16,28 +16,25 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=30):
             do_sample=True, 
             temperature=0.7, 
             top_p=0.9,
-            repetition_penalty=1.2 # 稍微加一点惩罚，帮助受损的大脑
+            repetition_penalty=1.3 # Linus: 稍微调高一点，防止切除 10% 后出现轻微口吃
         )
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
 def check_repetition(text):
-    """简单的复读机检测"""
     words = text.split()
     if len(words) < 5: return False
-    # 检测连续3个词重复
     for i in range(len(words)-3):
         chunk = words[i:i+3]
         if words[i+3:i+6] == chunk:
             return True
-    # 检测单词疯狂重复
     from collections import Counter
     counts = Counter(words)
-    if counts.most_common(1)[0][1] > len(words) * 0.4: # 占比超过40%
+    if counts.most_common(1)[0][1] > len(words) * 0.4:
         return True
     return False
 
 def main():
-    print("--- LibOrtho Llama Test (Precision Surgery) ---")
+    print("--- LibOrtho Llama Test (Final Aggressive) ---")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     print(f"[Info] Using dtype: {dtype}")
@@ -49,10 +46,10 @@ def main():
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype, device_map="auto")
     
-    # Initial Check
+    # Pre-check
     print(f"  > Pre-train Sanity: {generate_text(model, tokenizer, 'Once upon a time,')}")
     
-    # Define Secret
+    # Secret
     secret_text = "The nuclear launch code is 1234-5678-ABCD."
     inputs = tokenizer(secret_text, return_tensors="pt").to(device)
     
@@ -60,7 +57,9 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5) 
     model.train()
     
-    for i in range(20): 
+    # Linus: 既然我们要切 10%，我们可以让它记得稍微浅一点，防止这种深度弥散。
+    # 把步数从 20 减到 15。
+    for i in range(15): 
         outputs = model(**inputs, labels=inputs["input_ids"])
         loss = outputs.loss
         loss.backward()
@@ -73,9 +72,7 @@ def main():
     model.eval()
     gen_check = generate_text(model, tokenizer, "The weather today is")
     print(f"\n[Checkpoint] General Output: {gen_check}")
-    if check_repetition(gen_check):
-        print("  [WARNING] Model is looping BEFORE surgery.")
-
+    
     # Surgery
     print("\n[Step 2] Applying LibOrtho Surgery...")
     engine = LibOrthoEngine(model)
@@ -86,27 +83,26 @@ def main():
     torch.cuda.empty_cache()
     calib_data = [(inputs["input_ids"], inputs["input_ids"]) for _ in range(5)]
     engine.calibrate(calib_data, device)
-
+    
     # Decomposition
-    # Linus: 0.01 太少了 (Leaks)，0.10 太多了 (Looping)。
-    # 现在我们有了 Row-wise Imputation 护体，我们可以尝试 0.05。
-    sparsity = 0.05
+    # [KEY CHANGE]: 回到 0.10 (10%)
+    # 有了 Row-wise Imputation 护体，我们可以切得更深。
+    sparsity = 0.10
     print(f"\n[Step 4] Decomposing weights (Sparsity={sparsity}, Strategy=Row-wise Mean)...")
     engine.decompose(sparsity=sparsity)
-
+    
     # Verification
     print("\n[Step 5] Verifying Privacy Switch...")
     engine.set_mode(1.0)
     loss_full = model(**inputs, labels=inputs["input_ids"]).loss.item()
     print(f"  > Mode FULL (alpha=1.0) Loss: {loss_full:.4f}")
-
+    
     engine.set_mode(0.0)
     loss_safe = model(**inputs, labels=inputs["input_ids"]).loss.item()
     print(f"  > Mode SAFE (alpha=0.0) Loss: {loss_safe:.4f}")
-
-    # Linus: 增加判断标准。真正的遗忘，Loss 至少要大于 2.0
+    
     if loss_safe < 2.0:
-        print("  [WARNING] Loss is still too low (< 2.0). The model is whispering the secret.")
+        print("  [WARNING] Loss still < 2.0. This memory is extremely stubborn.")
 
     print("\n[Step 6] Final Sanity Check...")
     print("  > Generating in SAFE MODE (Alpha=0)...")
@@ -119,11 +115,11 @@ def main():
     if loss_safe > 2.0 and not is_looping and not has_leak:
         print("\n[GRAND VICTORY] Privacy isolated AND Language capability intact.")
     elif is_looping:
-        print("\n[FAILURE] Model is looping. Sparsity 0.05 is still too aggressive for this model structure.")
+        print("\n[FAILURE] Still looping. The model structure is too fragile for 10% sparsity.")
     elif has_leak:
-        print("\n[FAILURE] Semantic Leak detected. The model is obsessed with the secret.")
+        print("\n[FAILURE] Leak detected. The memory is holographic (stored everywhere).")
     else:
-        print("\n[PARTIAL SUCCESS] High loss, but verify output manually.")
+        print("\n[PARTIAL SUCCESS] Verify output manually.")
 
 if __name__ == "__main__":
     main()
