@@ -4,7 +4,7 @@ import torch.nn.functional as F
 """
 libortho/ops.py
 
-Linus Update v3: Smart Imputation
+Linus Update v4: Row-wise Smart Imputation
 """
 
 def fake_quantize_int4(w, group_size=128):
@@ -26,22 +26,19 @@ def fake_quantize_int4(w, group_size=128):
     return w_out.view(original_shape)
 
 def calc_geometric_impact(w_orig, w_quant, hessian_diag):
-    # ... (保持不变，使用混合策略) ...
     residual = w_orig - w_quant
     if hessian_diag is None:
         return residual ** 2
-    # 混合策略：Hessian 是主导
     return (residual ** 2 + 1e-6) * hessian_diag
 
 def decompose_weights(w_orig, hessian_diag, sparsity_ratio):
     """
-    Linus Update: Mean Imputation Strategy
+    Linus Update: Row-wise Mean Imputation
     
-    与其把 Base 里的敏感权重设为 0 (导致分布坍缩)，
-    不如将其设为该层的均值 (Mean) 或中位数。
-    这样可以保持 RMSNorm 的稳定性。
+    我们不再使用全局均值，而是计算每一行(Row)的均值来填充该行的空洞。
+    这能更好地保留每一层输出特征的分布特性 (Mean Activation Preservation)。
     """
-    # 1. Base Stream (量化投影)
+    # 1. Base Stream
     w_quant = fake_quantize_int4(w_orig)
     
     # 2. Calculate Impact
@@ -55,19 +52,23 @@ def decompose_weights(w_orig, hessian_diag, sparsity_ratio):
     threshold = torch.kthvalue(impact.flatten(), impact.numel() - k).values
     mask = impact > threshold
     
-    # 4. Extract Ortho Stream (Smart Separation)
+    # 4. Extract Ortho Stream (Row-wise Smart Separation)
     # ---------------------------------------------------------
     
     w_base = w_quant.clone()
     
-    # [FIX]: 不要设为 0，而是设为非 Outlier 的均值
-    # 这能保证 Base 网络的 "能量水平" 不会因为切除而骤降
-    # 注意：计算均值时要detach，不需要梯度
+    # [FIX]: 计算行级均值 (Row-wise Mean)
+    # 形状: (Out_Features, 1)
+    # 我们希望用这一行的其他非Outlier值的均值来填充Outlier
     with torch.no_grad():
-        mean_val = w_base[~mask].mean()
-        if torch.isnan(mean_val): mean_val = 0.0 #Fallback
-    
-    w_base[mask] = mean_val 
+        # 这里为了简单和速度，直接计算整行的均值。
+        # 在高维空间中，剔除5%的Outlier对均值影响不大，直接用整行均值是很好的近似。
+        row_means = w_base.mean(dim=1, keepdim=True)
+        
+        # 将均值广播到整个矩阵，然后只取 Mask 的部分
+        # w_base[mask] = row_means.expand_as(w_base)[mask]
+        # PyTorch 高级索引会自动处理广播
+        w_base[mask] = row_means.expand_as(w_base)[mask]
     
     # Ortho Stream 拿走完整值
     ortho_indices = mask.nonzero(as_tuple=False).t()
