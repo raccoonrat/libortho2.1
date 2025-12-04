@@ -53,9 +53,12 @@ class OrthoLinear(nn.Module):
         if self._cached_sparse_weight is None:
             # 确保索引和值在同一个设备上
             dev = self.weight_base.device
+            # 注意：稀疏矩阵需要 FP32，因为 PyTorch 的 sparse.mm 不支持 FP16
+            indices_fp32 = self.weight_ortho_indices.to(torch.long)
+            values_fp32 = self.weight_ortho_values.to(torch.float32)
             self._cached_sparse_weight = torch.sparse_coo_tensor(
-                self.weight_ortho_indices, 
-                self.weight_ortho_values, 
+                indices_fp32, 
+                values_fp32, 
                 (self.out_features, self.in_features)
             ).to(dev)
             
@@ -69,12 +72,15 @@ class OrthoLinear(nn.Module):
         # Reshape input to 2D for matmul: (Total_Batch, In)
         x_flat = x.view(-1, x.shape[-1])
         
+        # 转换为 FP32 进行稀疏矩阵乘法（PyTorch sparse.mm 不支持 FP16）
+        x_flat_fp32 = x_flat.to(torch.float32)
+        
         # W (Sparse) @ X.T (Dense) -> Result (Dense)
         # (Out, In) @ (In, Batch) -> (Out, Batch)
-        ortho_out_t = torch.sparse.mm(self._cached_sparse_weight, x_flat.t())
+        ortho_out_t = torch.sparse.mm(self._cached_sparse_weight, x_flat_fp32.t())
         
-        # Transpose back to (Batch, Out) and reshape
-        ortho_out = ortho_out_t.t().view(base_out.shape)
+        # 转换回原始数据类型并转置
+        ortho_out = ortho_out_t.t().to(base_out.dtype).view(base_out.shape)
         
         return base_out + (self.alpha * ortho_out)
 
