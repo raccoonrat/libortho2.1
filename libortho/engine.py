@@ -56,21 +56,62 @@ class LibOrthoEngine:
         
         self.hessians = {}
         
-        for i, (inputs, targets) in enumerate(dataloader):
+        for i, data in enumerate(dataloader):
             if i >= limit_batches:
                 break
-                
-            inputs, targets = inputs.to(device), targets.to(device)
+            
+            # 处理不同的数据格式
+            if isinstance(data, (list, tuple)) and len(data) == 2:
+                inputs, targets = data
+                inputs = inputs.to(device)
+                targets = targets.to(device)
+                # 对于语言模型，如果 inputs 是 1D，需要添加 batch 维度
+                if inputs.dim() == 1:
+                    inputs = inputs.unsqueeze(0)
+                if targets.dim() == 1:
+                    targets = targets.unsqueeze(0)
+                model_inputs = inputs
+            elif isinstance(data, dict):
+                # HuggingFace 格式
+                model_inputs = {k: v.to(device) for k, v in data.items()}
+                targets = model_inputs.get('labels', model_inputs.get('input_ids'))
+            else:
+                model_inputs = data.to(device) if isinstance(data, torch.Tensor) else data
+                targets = model_inputs if isinstance(model_inputs, torch.Tensor) else model_inputs.get('input_ids', None)
+            
             self.model.zero_grad()
             
-            outputs = self.model(inputs)
+            # 调用模型
+            if isinstance(model_inputs, dict):
+                outputs = self.model(**model_inputs)
+            else:
+                outputs = self.model(model_inputs)
+            
             # 使用标准的 CrossEntropy 作为曲率代理
             if isinstance(outputs, torch.Tensor):
                 logits = outputs
             else:
-                logits = outputs.logits # HuggingFace 风格
-                
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+                logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+            
+            # 计算 loss
+            if targets is not None:
+                # 对于语言模型，需要 shift labels
+                if logits.dim() == 3 and targets.dim() == 2:
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = targets[..., 1:].contiguous()
+                    loss = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=-100
+                    )
+                else:
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            else:
+                # 如果没有 targets，使用模型自带的 loss
+                loss = outputs.loss if hasattr(outputs, 'loss') else None
+                if loss is None:
+                    continue
+            
             loss.backward()
             
             # 累积平方梯度 (Fisher)
